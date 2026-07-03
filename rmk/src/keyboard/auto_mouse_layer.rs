@@ -10,30 +10,94 @@
 //! `device_id == None` (if any) is used as a fallback. Events that match
 //! neither are ignored.
 
-use embassy_futures::select::{Either, Either3, select, select3};
+use embassy_futures::select::{Either, select};
 use embassy_time::{Instant, Timer};
 use heapless::Vec;
+use rmk_macro::processor;
 
 use crate::AUTO_MOUSE_LAYER_MAX_NUM;
 use crate::config::AutoMouseLayerConfig;
 use crate::core_traits::Runnable;
-use crate::event::{Axis, AxisValType, EventSubscriber, LayerChangeEvent, PointingEvent, SubscribableEvent};
+use crate::event::{Axis, AxisValType, LayerChangeEvent, PointingEvent};
 use crate::keymap::KeyMap;
+use crate::processor::Processor;
 
 /// [`Runnable`] for the auto mouse layer task.
 ///
-/// Construct with [`run_auto_mouse_layer_if_enabled`] and pass to `run_all!`.
-/// If the keymap has no auto mouse layer configured (or every entry's layer is
-/// out of range), [`Runnable::run`] parks forever on [`core::future::pending`]
-/// so it can sit alongside the other tasks without doing anything.
+/// Construct with [`AutoMouseLayerRunner::new`] and pass to `run_all!`. If the
+/// keymap has no auto mouse layer configured (or every entry's layer is out of
+/// range), [`Runnable::run`] parks forever on [`core::future::pending`] so it
+/// can sit alongside the other tasks without doing anything.
+#[processor(subscribe = [PointingEvent, LayerChangeEvent])]
+#[::rmk::macros::runnable_generated]
 pub struct AutoMouseLayerRunner<'a, 'k> {
     keymap: &'a KeyMap<'k>,
+    entries: Vec<EntryState, AUTO_MOUSE_LAYER_MAX_NUM>,
 }
 
-/// Build a [`Runnable`] that activates the configured auto mouse layer on
-/// pointer motion. Pass the returned value to `run_all!`.
-pub fn run_auto_mouse_layer_if_enabled<'a, 'k>(keymap: &'a KeyMap<'k>) -> AutoMouseLayerRunner<'a, 'k> {
-    AutoMouseLayerRunner { keymap }
+impl<'a, 'k> AutoMouseLayerRunner<'a, 'k> {
+    /// Build the runner from the keymap's `[behavior.auto_mouse_layer]` config.
+    pub fn new(keymap: &'a KeyMap<'k>) -> Self {
+        let num_layer = keymap.num_layer();
+        let configs = keymap.auto_mouse_layer_configs();
+        let mut entries: Vec<EntryState, AUTO_MOUSE_LAYER_MAX_NUM> = Vec::new();
+        for config in configs.iter().copied() {
+            if (config.target_layer as usize) >= num_layer {
+                warn!(
+                    "auto_mouse_layer: configured target_layer {} is out of range (keymap has {} layers); \
+                     entry for device_id {:?} will be ignored",
+                    config.target_layer, num_layer, config.device_id
+                );
+                continue;
+            }
+            // threshold == 0 would short-circuit motion detection — guard against
+            // a misconfigured Rust-API caller bypassing AutoMouseLayerConfig::new.
+            let mut config = config;
+            config.threshold = config.threshold.max(1);
+            // Capacity already matches AUTO_MOUSE_LAYER_MAX_NUM upstream.
+            let _ = entries.push(EntryState {
+                config,
+                self_activated: false,
+                deadline: None,
+                overlap_warned: false,
+            });
+        }
+        Self { keymap, entries }
+    }
+
+    async fn on_pointing_event(&mut self, event: PointingEvent) {
+        let Some(idx) = match_entry(&self.entries, event.device_id) else {
+            return;
+        };
+        if !is_cursor_motion(&event, self.entries[idx].config.threshold) {
+            return;
+        }
+        let target_layer = self.entries[idx].config.target_layer;
+        let activated_by_us = self.keymap.activate_layer_if_inactive(target_layer);
+        if pointing_step(&mut self.entries, idx, Instant::now(), activated_by_us) == PointingOutcome::OverlapFirstSeen {
+            warn!(
+                "auto_mouse_layer: layer {} is already active when motion was detected; \
+                 the layer is likely driven by another key (MO/TG). The auto mouse layer \
+                 will not be deactivated on timeout while overlap holds.",
+                target_layer
+            );
+        }
+    }
+
+    async fn on_layer_change_event(&mut self, LayerChangeEvent(top): LayerChangeEvent) {
+        // Layer turned off externally (MO/TG key etc.) — release our hold.
+        let keymap = self.keymap;
+        for entry in self.entries.iter_mut() {
+            if entry.self_activated && !keymap.is_layer_active(entry.config.target_layer) {
+                entry.self_activated = false;
+                entry.deadline = None;
+                trace!(
+                    "auto_mouse_layer: cleared tracking for layer {} (top now {})",
+                    entry.config.target_layer, top
+                );
+            }
+        }
+    }
 }
 
 /// Per-entry runtime state.
@@ -60,105 +124,32 @@ enum PointingOutcome {
 
 impl Runnable for AutoMouseLayerRunner<'_, '_> {
     async fn run(&mut self) -> ! {
-        let keymap = self.keymap;
-        let num_layer = keymap.num_layer();
-
-        let configs = keymap.auto_mouse_layer_configs();
-        let mut entries: Vec<EntryState, AUTO_MOUSE_LAYER_MAX_NUM> = Vec::new();
-        for config in configs.iter().copied() {
-            if (config.target_layer as usize) >= num_layer {
-                warn!(
-                    "auto_mouse_layer: configured target_layer {} is out of range (keymap has {} layers); \
-                     entry for device_id {:?} will be ignored",
-                    config.target_layer, num_layer, config.device_id
-                );
-                continue;
-            }
-            // threshold == 0 would short-circuit motion detection — guard against
-            // a misconfigured Rust-API caller bypassing AutoMouseLayerConfig::new.
-            let mut config = config;
-            config.threshold = config.threshold.max(1);
-            // Capacity already matches AUTO_MOUSE_LAYER_MAX_NUM upstream.
-            let _ = entries.push(EntryState {
-                config,
-                self_activated: false,
-                deadline: None,
-                overlap_warned: false,
-            });
-        }
-
-        if entries.is_empty() {
+        if self.entries.is_empty() {
             core::future::pending().await
         }
 
-        let mut subscriber = PointingEvent::subscriber();
-        let mut layer_sub = LayerChangeEvent::subscriber();
+        use crate::event::EventSubscriber;
+        let mut sub = <Self as Processor>::subscriber();
 
         loop {
-            let earliest = earliest_deadline(&entries);
-            let next = match earliest {
-                Some(deadline) => {
-                    match select3(Timer::at(deadline), subscriber.next_event(), layer_sub.next_event()).await {
-                        Either3::First(_) => Tick::Timeout,
-                        Either3::Second(e) => Tick::Pointing(e),
-                        Either3::Third(e) => Tick::Layer(e),
-                    }
-                }
-                None => match select(subscriber.next_event(), layer_sub.next_event()).await {
-                    Either::First(e) => Tick::Pointing(e),
-                    Either::Second(e) => Tick::Layer(e),
-                },
-            };
-
-            match next {
-                Tick::Timeout => {
-                    let now = Instant::now();
-                    for layer in timeout_step(&mut entries, now) {
-                        keymap.deactivate_layer_if_active(layer);
-                    }
-                }
-                Tick::Pointing(event) => {
-                    let Some(idx) = match_entry(&entries, event.device_id) else {
-                        continue;
-                    };
-                    if !is_cursor_motion(&event, entries[idx].config.threshold) {
-                        continue;
-                    }
-                    let target_layer = entries[idx].config.target_layer;
-                    let activated_by_us = keymap.activate_layer_if_inactive(target_layer);
-                    if pointing_step(&mut entries, idx, Instant::now(), activated_by_us)
-                        == PointingOutcome::OverlapFirstSeen
-                    {
-                        warn!(
-                            "auto_mouse_layer: layer {} is already active when motion was detected; \
-                             the layer is likely driven by another key (MO/TG). The auto mouse layer \
-                             will not be deactivated on timeout while overlap holds.",
-                            target_layer
-                        );
-                    }
-                }
-                Tick::Layer(LayerChangeEvent(top)) => {
-                    // Layer turned off externally (MO/TG key etc.) — release our hold.
-                    for entry in entries.iter_mut() {
-                        if entry.self_activated && !keymap.is_layer_active(entry.config.target_layer) {
-                            entry.self_activated = false;
-                            entry.deadline = None;
-                            trace!(
-                                "auto_mouse_layer: cleared tracking for layer {} (top now {})",
-                                entry.config.target_layer, top
-                            );
+            let earliest = earliest_deadline(&self.entries);
+            match earliest {
+                Some(deadline) => match select(Timer::at(deadline), sub.next_event()).await {
+                    Either::First(_) => {
+                        let now = Instant::now();
+                        for layer in timeout_step(&mut self.entries, now) {
+                            self.keymap.deactivate_layer_if_active(layer);
                         }
                     }
+                    Either::Second(event) => self.process(event).await,
+                },
+                None => {
+                    let event = sub.next_event().await;
+                    self.process(event).await;
                 }
             }
         }
     }
-}
-
-enum Tick {
-    Timeout,
-    Pointing(PointingEvent),
-    Layer(LayerChangeEvent),
 }
 
 fn earliest_deadline(entries: &[EntryState]) -> Option<Instant> {

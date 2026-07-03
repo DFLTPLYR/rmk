@@ -72,7 +72,7 @@ pub(crate) fn rmk_entry_select(
     let auto_mouse_layer_enabled = !behavior.auto_mouse_layer.is_empty();
     let auto_mouse_layer_prelude = auto_mouse_layer_enabled.then(|| {
         quote! {
-            let mut auto_mouse_layer = ::rmk::run_auto_mouse_layer_if_enabled(&keymap);
+            let mut auto_mouse_layer = ::rmk::AutoMouseLayerRunner::new(&keymap);
         }
     });
     let devices_task = {

@@ -43,7 +43,7 @@ pub use heapless;
 // Re-exported here so generated code from `#[rmk_keyboard]` and pure-Rust API
 // users can spawn the auto mouse layer task without depending on internal
 // module paths.
-pub use keyboard::auto_mouse_layer::run_auto_mouse_layer_if_enabled;
+pub use keyboard::auto_mouse_layer::AutoMouseLayerRunner;
 use keymap::KeyMap;
 pub use keymap::KeymapData;
 pub use rmk_macro as macros;

@@ -591,7 +591,7 @@ let behavior_config = BehaviorConfig {
 };
 
 // include it in `run_all!` alongside the rest:
-let mut auto_mouse_layer = rmk::run_auto_mouse_layer_if_enabled(&keymap);
+let mut auto_mouse_layer = rmk::AutoMouseLayerRunner::new(&keymap);
 run_all!(
     matrix,
     keyboard,
